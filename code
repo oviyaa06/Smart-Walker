@@ -1,0 +1,472 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <MPU6050.h>
+#include "HX711.h"
+#include <math.h>
+
+// ---------------- LCD ----------------
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// ---------------- MPU6050 ----------------
+MPU6050 mpuRight(0x68);
+MPU6050 mpuLeft(0x69);
+
+// ---------------- HX711 ----------------
+HX711 scaleRight;
+HX711 scaleLeft;
+#define DT1  3
+#define SCK1 2
+#define DT2  5
+#define SCK2 4
+
+// ---------------- Ultrasonic ----------------
+#define TRIG1 6
+#define ECHO1 7
+#define TRIG2 8
+#define ECHO2 9
+
+// ---------------- Buzzer ----------------
+#define BUZZER 11
+
+// ---------------- Thresholds ----------------
+#define STEP_THRESHOLD_HIGH   3000     // tune after running step_debug.ino
+#define STEP_THRESHOLD_LOW    1500     // tune after running step_debug.ino
+#define TILT_THRESHOLD        12
+#define DIST_THRESHOLD        30
+#define CALIB_FACTOR          420.0
+#define NOISE_THRESHOLD       2.0
+#define WEIGHT_MAX_THRESHOLD  500.0
+#define WEIGHT_UNEVEN_DIFF    150.0
+#define BUZZ_OBSTACLE_FREQ    2000
+#define BUZZ_WEIGHT_FREQ      800
+#define BUZZ_FALL_FREQ        3000
+#define BUZZ_STARTUP_FREQ     1500
+#define FALL_CONFIRM_COUNT    2
+#define EMA_ALPHA             0.5
+#define GRAVITY_OFFSET        16384   // raw Z value when sensor is flat/still
+
+// ---------------- MPU Baseline (X and Y only) ----------------
+int16_t baseAxR = 0, baseAyR = 0;
+int16_t baseAxL = 0, baseAyL = 0;
+
+// ---------------- EMA Smoothed Angles ----------------
+float emaAngleLeft  = 0;
+float emaAngleRight = 0;
+
+// ---------------- Fall Debounce ----------------
+int fallConsecutiveCount = 0;
+
+// ---------------- Variables ----------------
+int     distanceRight = 0, distanceLeft = 0;
+float   weightRight   = 0, weightLeft   = 0;
+int16_t axL = 0, ayL = 0, azL = 0;
+int16_t axR = 0, ayR = 0, azR = 0;
+float   angleLeft  = 0, angleRight  = 0;
+long    accelMagRight = 0, accelMagLeft = 0;
+int     steps         = 0;
+bool    stepDetected  = false;
+float   speed         = 0;
+
+unsigned long prevTime         = 0;
+unsigned long buzzerPrevMillis = 0;
+unsigned long lcdPrevMillis    = 0;
+int  buzzerPattern = 0;
+
+char lcdRow0[17];
+char lcdRow1[17];
+
+// ---------------- I2C Bus Recovery ----------------
+void i2cRecovery() {
+  Wire.end();
+  pinMode(A4, OUTPUT);
+  pinMode(A5, OUTPUT);
+  digitalWrite(A4, HIGH);
+  for (int i = 0; i < 9; i++) {
+    digitalWrite(A5, HIGH); delayMicroseconds(5);
+    digitalWrite(A5, LOW);  delayMicroseconds(5);
+  }
+  digitalWrite(A4, LOW);  delayMicroseconds(5);
+  digitalWrite(A5, HIGH); delayMicroseconds(5);
+  digitalWrite(A4, HIGH); delayMicroseconds(5);
+  Wire.begin();
+  delay(50);
+}
+
+// ---------------- LCD Safe Print ----------------
+void lcdWriteRow(int row, const char* text) {
+  char buf[17];
+  int i = 0;
+  while (i < 16 && text[i] != '\0') { buf[i] = text[i]; i++; }
+  while (i < 16) { buf[i] = ' '; i++; }
+  buf[16] = '\0';
+  lcd.setCursor(0, row);
+  lcd.print(buf);
+}
+
+// ---------------- Init MPUs ----------------
+void initMPUs() {
+  mpuRight.initialize();
+  delay(50);
+  mpuLeft.initialize();
+  delay(50);
+
+  mpuRight.setDLPFMode(6);
+  mpuLeft.setDLPFMode(6);
+
+  Wire.beginTransmission(0x68);
+  byte errR = Wire.endTransmission();
+  Wire.beginTransmission(0x69);
+  byte errL = Wire.endTransmission();
+  if (errR != 0) Serial.println("MPU RIGHT not responding!");
+  if (errL != 0) Serial.println("MPU LEFT not responding!");
+}
+
+// ---------------- Read MPU (3-sample average) ----------------
+// Only subtracts baseline from X and Y
+// Z is left raw so gravity (~16384) stays in denominator of atan2
+void readMPUAveraged(MPU6050 &mpu,
+                     int16_t bax, int16_t bay,
+                     int16_t &outAx, int16_t &outAy, int16_t &outAz) {
+  long sx = 0, sy = 0, sz = 0;
+  int16_t tx, ty, tz;
+  for (int i = 0; i < 3; i++) {
+    mpu.getAcceleration(&tx, &ty, &tz);
+    sx += tx; sy += ty; sz += tz;
+    delay(2);
+  }
+  outAx = (int16_t)(sx / 3) - bax;
+  outAy = (int16_t)(sy / 3) - bay;
+  outAz = (int16_t)(sz / 3);        // Z kept raw for tilt angle
+}
+
+// ---------------- Calibrate MPU Baselines (X and Y only) ----------------
+void calibrateMPUs() {
+  Serial.println("Calibrating — keep walker FLAT and STILL...");
+  lcdWriteRow(0, "Calibrating...  ");
+  lcdWriteRow(1, "Keep FLAT+STILL ");
+  delay(1000);
+
+  long sumAxR=0, sumAyR=0, sumAzR=0;
+  long sumAxL=0, sumAyL=0, sumAzL=0;
+  int16_t tx, ty, tz;
+
+  for (int i = 0; i < 50; i++) {
+    mpuRight.getAcceleration(&tx, &ty, &tz);
+    sumAxR += tx; sumAyR += ty; sumAzR += tz;
+    mpuLeft.getAcceleration(&tx, &ty, &tz);
+    sumAxL += tx; sumAyL += ty; sumAzL += tz;
+    delay(30);
+  }
+
+  baseAxR = sumAxR / 50;  baseAyR = sumAyR / 50;
+  baseAxL = sumAxL / 50;  baseAyL = sumAyL / 50;
+
+  int16_t avgAzR = sumAzR / 50;
+  int16_t avgAzL = sumAzL / 50;
+
+  Serial.print("Base RIGHT: X="); Serial.print(baseAxR);
+  Serial.print(" Y="); Serial.print(baseAyR);
+  Serial.print(" Z(raw)="); Serial.println(avgAzR);
+  Serial.print("Base LEFT:  X="); Serial.print(baseAxL);
+  Serial.print(" Y="); Serial.print(baseAyL);
+  Serial.print(" Z(raw)="); Serial.println(avgAzL);
+
+  bool rightOK = (abs(baseAxR) < 5000 && abs(avgAzR) > 10000);
+  bool leftOK  = (abs(baseAxL) < 5000 && abs(avgAzL) > 10000);
+
+  if (!rightOK) {
+    Serial.println("WARNING: RIGHT MPU — was it flat during calibration?");
+    lcdWriteRow(0, "RIGHT CAL WARN! ");
+    lcdWriteRow(1, "Check mounting  ");
+    delay(2000);
+  }
+  if (!leftOK) {
+    Serial.println("WARNING: LEFT MPU — was it flat during calibration?");
+    lcdWriteRow(0, "LEFT CAL WARN!  ");
+    lcdWriteRow(1, "Check mounting  ");
+    delay(2000);
+  }
+  if (rightOK && leftOK) Serial.println("Calibration OK.");
+}
+
+// ---------------- Tilt Angle ----------------
+float getTiltAngle(int16_t ax, int16_t ay, int16_t az) {
+  return atan2((float)ax, sqrt((float)ay * ay + (float)az * az)) * 180.0 / PI;
+}
+
+// ---------------- Buzzer ----------------
+void handleBuzzer(int pattern) {
+  unsigned long now = millis();
+  if (pattern == 0) { noTone(BUZZER); return; }
+  if (pattern == 1) {
+    unsigned long elapsed = (now - buzzerPrevMillis) % 160UL;
+    if (elapsed < 80) tone(BUZZER, BUZZ_OBSTACLE_FREQ);
+    else              noTone(BUZZER);
+  }
+  if (pattern == 2) {
+    unsigned long elapsed = (now - buzzerPrevMillis) % 1200UL;
+    if      (elapsed < 120) tone(BUZZER, BUZZ_WEIGHT_FREQ);
+    else if (elapsed < 240) noTone(BUZZER);
+    else if (elapsed < 360) tone(BUZZER, BUZZ_WEIGHT_FREQ);
+    else                    noTone(BUZZER);
+  }
+}
+
+void buzzBlocking(int freq, int durationMs) {
+  tone(BUZZER, freq);
+  delay(durationMs);
+  noTone(BUZZER);
+}
+
+// ---------------- Ultrasonic ----------------
+int getDistance(int trig, int echo) {
+  digitalWrite(trig, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trig, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trig, LOW);
+  long dur = pulseIn(echo, HIGH, 25000UL);
+  if (dur == 0) return 999;
+  return (int)(dur * 0.034 / 2);
+}
+
+// ---------------- Weight ----------------
+float getStableWeight(HX711 &scale) {
+  if (!scale.is_ready()) return -1;
+  float w = scale.get_units(1);
+  if (w > -NOISE_THRESHOLD && w < NOISE_THRESHOLD) w = 0;
+  if (w < 0) w = 0;
+  return w;
+}
+
+// ================================================================
+// SETUP
+// ================================================================
+void setup() {
+  Serial.begin(9600);
+  pinMode(BUZZER, OUTPUT);
+  pinMode(TRIG1, OUTPUT); pinMode(ECHO1, INPUT);
+  pinMode(TRIG2, OUTPUT); pinMode(ECHO2, INPUT);
+
+  buzzBlocking(BUZZ_STARTUP_FREQ, 150);
+  delay(80);
+  buzzBlocking(BUZZ_STARTUP_FREQ, 150);
+
+  Wire.begin();
+  Wire.setClock(100000);
+  delay(100);
+
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  lcdWriteRow(0, "Walker System   ");
+  lcdWriteRow(1, "Starting...     ");
+
+  initMPUs();
+
+  scaleRight.begin(DT1, SCK1);
+  scaleLeft.begin(DT2, SCK2);
+  unsigned long t = millis();
+  while (!scaleRight.is_ready() && millis() - t < 3000) delay(10);
+  Serial.println(scaleRight.is_ready() ? "RIGHT scale: OK" : "RIGHT scale: NOT FOUND");
+  t = millis();
+  while (!scaleLeft.is_ready() && millis() - t < 3000) delay(10);
+  Serial.println(scaleLeft.is_ready() ? "LEFT scale: OK" : "LEFT scale: NOT FOUND");
+
+  scaleRight.set_scale(CALIB_FACTOR);
+  scaleLeft.set_scale(CALIB_FACTOR);
+  delay(500);
+  scaleRight.tare();
+  scaleLeft.tare();
+  Serial.println("Scales tared.");
+
+  lcd.clear();
+  lcdWriteRow(0, "Hold still...   ");
+  lcdWriteRow(1, "2s warmup...    ");
+  delay(2000);
+
+  calibrateMPUs();
+
+  readMPUAveraged(mpuLeft,  baseAxL, baseAyL, axL, ayL, azL);
+  readMPUAveraged(mpuRight, baseAxR, baseAyR, axR, ayR, azR);
+  emaAngleLeft  = getTiltAngle(axL, ayL, azL);
+  emaAngleRight = getTiltAngle(axR, ayR, azR);
+
+  lcd.clear();
+  lcdWriteRow(0, "Walker Ready!   ");
+  delay(1500);
+  lcd.clear();
+
+  prevTime         = millis();
+  buzzerPrevMillis = millis();
+  lcdPrevMillis    = millis();
+}
+
+// ================================================================
+// LOOP
+// ================================================================
+void loop() {
+  bool ultrasonicAlert = false;
+  bool weightAlert     = false;
+
+  // -------- I2C health check --------
+  Wire.beginTransmission(0x68);
+  if (Wire.endTransmission() != 0) {
+    Serial.println("I2C issue — recovering...");
+    i2cRecovery();
+    initMPUs();
+    lcd.init();
+    lcd.backlight();
+  }
+
+  // -------- Distance --------
+  distanceRight = getDistance(TRIG1, ECHO1);
+  distanceLeft  = getDistance(TRIG2, ECHO2);
+  if (distanceRight < DIST_THRESHOLD || distanceLeft < DIST_THRESHOLD)
+    ultrasonicAlert = true;
+
+  // -------- Weight --------
+  float rawRight = getStableWeight(scaleRight);
+  float rawLeft  = getStableWeight(scaleLeft);
+  if (rawRight >= 0) weightRight = rawRight;
+  if (rawLeft  >= 0) weightLeft  = rawLeft;
+  float totalWeight = weightRight + weightLeft;
+  float weightDiff  = abs(weightRight - weightLeft);
+  if (totalWeight > WEIGHT_MAX_THRESHOLD) weightAlert = true;
+  if (weightDiff  > WEIGHT_UNEVEN_DIFF)   weightAlert = true;
+
+  // -------- MPU — 3-sample average, X/Y baseline subtracted, Z raw --------
+  readMPUAveraged(mpuRight, baseAxR, baseAyR, axR, ayR, azR);
+  readMPUAveraged(mpuLeft,  baseAxL, baseAyL, axL, ayL, azL);
+
+  // -------- Angles --------
+  angleLeft  = getTiltAngle(axL, ayL, azL);
+  angleRight = getTiltAngle(axR, ayR, azR);
+
+  // -------- EMA Smoothing --------
+  emaAngleLeft  = EMA_ALPHA * angleLeft  + (1.0 - EMA_ALPHA) * emaAngleLeft;
+  emaAngleRight = EMA_ALPHA * angleRight + (1.0 - EMA_ALPHA) * emaAngleRight;
+
+  // -------- Step Detection --------
+  // Subtract GRAVITY_OFFSET from Z so resting baseline is near 0 (not ~16384)
+  // Without this, resting mag = ~16384 and walking peaks barely exceed 25000
+  // With this,    resting mag = ~0     and walking peaks are clearly visible ~2000-5000
+  long stepMagR = abs(axR) + abs(ayR) + abs(azR - GRAVITY_OFFSET);
+  long stepMagL = abs(axL) + abs(ayL) + abs(azL - GRAVITY_OFFSET);
+  long stepMagnitude = (stepMagR + stepMagL) / 2;
+
+  if (stepMagnitude > STEP_THRESHOLD_HIGH && !stepDetected) {
+    steps++;
+    stepDetected = true;
+  }
+  if (stepMagnitude < STEP_THRESHOLD_LOW) stepDetected = false;
+
+  // Keep accelMagRight/Left for serial debug (raw, not gravity-subtracted)
+  accelMagRight = abs(axR) + abs(ayR) + abs(azR);
+  accelMagLeft  = abs(axL) + abs(ayL) + abs(azL);
+
+  // -------- Speed --------
+  unsigned long currentTime = millis();
+  float timeDiff = (currentTime - prevTime) / 1000.0;
+  if (timeDiff >= 1.0) {
+    speed    = steps * 0.7 / timeDiff;
+    prevTime = currentTime;
+  }
+
+  // -------- Fall Detection (smoothed + debounced) --------
+  bool leftFall  = (abs(emaAngleLeft)  > TILT_THRESHOLD);
+  bool rightFall = (abs(emaAngleRight) > TILT_THRESHOLD);
+
+  if (leftFall || rightFall) {
+    fallConsecutiveCount++;
+  } else {
+    fallConsecutiveCount = 0;
+  }
+
+  if (fallConsecutiveCount >= FALL_CONFIRM_COUNT) {
+    fallConsecutiveCount = 0;
+    noTone(BUZZER);
+    lcd.clear();
+    lcdWriteRow(0, "!! FALL DETECTED");
+
+    if      (leftFall && rightFall) lcdWriteRow(1, "BOTH sides!     ");
+    else if (leftFall)              lcdWriteRow(1, "RIGHT side!      ");
+    else                            lcdWriteRow(1, "LEFT side!     ");
+
+    Serial.println("*** FALL DETECTED ***");
+    if (leftFall)  { Serial.print("  >> LEFT  triggered | EMA Angle: ");  Serial.println(emaAngleLeft,  2); }
+    if (rightFall) { Serial.print("  >> RIGHT triggered | EMA Angle: "); Serial.println(emaAngleRight, 2); }
+    Serial.print("  Threshold: "); Serial.print(TILT_THRESHOLD); Serial.println(" deg");
+
+    buzzBlocking(BUZZ_FALL_FREQ, 3000);
+    lcd.clear();
+    return;
+  }
+
+  // -------- Buzzer Priority --------
+  if (ultrasonicAlert) {
+    if (buzzerPattern != 1) { buzzerPrevMillis = millis(); buzzerPattern = 1; }
+  } else if (weightAlert) {
+    if (buzzerPattern != 2) { buzzerPrevMillis = millis(); buzzerPattern = 2; }
+  } else {
+    buzzerPattern = 0;
+  }
+  handleBuzzer(buzzerPattern);
+
+  // -------- LCD (every 500ms) --------
+  if (millis() - lcdPrevMillis >= 500) {
+    lcdPrevMillis = millis();
+
+    char spBuf[6];
+    char wLBuf[5];
+    char wRBuf[5];
+
+    dtostrf(speed,       4, 1, spBuf);
+    dtostrf(weightLeft,  3, 0, wLBuf);
+    dtostrf(weightRight, 3, 0, wRBuf);
+
+    snprintf(lcdRow0, sizeof(lcdRow0), "S:%d Sp:%sm/s", steps, spBuf);
+    snprintf(lcdRow1, sizeof(lcdRow1), "L:%sg R:%sg",   wLBuf, wRBuf);
+
+    lcdWriteRow(0, lcdRow0);
+    lcdWriteRow(1, lcdRow1);
+  }
+
+  // -------- Serial Monitor --------
+  Serial.println("-----------------------------");
+  Serial.print("Weight L: ");
+  if (rawLeft  < 0) Serial.println("NOT READY");
+  else { Serial.print(weightLeft,  2); Serial.println(" g"); }
+  Serial.print("Weight R: ");
+  if (rawRight < 0) Serial.println("NOT READY");
+  else { Serial.print(weightRight, 2); Serial.println(" g"); }
+
+  Serial.print("RIGHT MPU  X:"); Serial.print(axR);
+  Serial.print(" Y:"); Serial.print(ayR);
+  Serial.print(" Z:"); Serial.print(azR);
+  Serial.print("  RawMag:"); Serial.println(accelMagRight);
+
+  Serial.print("LEFT  MPU  X:"); Serial.print(axL);
+  Serial.print(" Y:"); Serial.print(ayL);
+  Serial.print(" Z:"); Serial.print(azL);
+  Serial.print("  RawMag:"); Serial.println(accelMagLeft);
+
+  Serial.print("StepMag: "); Serial.print(stepMagnitude);
+  Serial.print("  HIGH:"); Serial.print(STEP_THRESHOLD_HIGH);
+  Serial.print("  LOW:"); Serial.println(STEP_THRESHOLD_LOW);
+
+  Serial.print("Raw  Angle L: "); Serial.print(angleLeft,      1);
+  Serial.print("  R: ");          Serial.println(angleRight,   1);
+  Serial.print("EMA  Angle L: "); Serial.print(emaAngleLeft,   1);
+  Serial.print("  R: ");          Serial.println(emaAngleRight, 1);
+  Serial.print("Fall counter: "); Serial.println(fallConsecutiveCount);
+
+  Serial.print("Steps: "); Serial.println(steps);
+  Serial.print("Speed: "); Serial.print(speed, 2); Serial.println(" m/s");
+  Serial.print("Dist R: "); Serial.print(distanceRight);
+  Serial.print(" cm | L: "); Serial.print(distanceLeft); Serial.println(" cm");
+  if (ultrasonicAlert) Serial.println("*** OBSTACLE ALERT ***");
+  if (weightAlert)     Serial.println("*** WEIGHT ALERT ***");
+
+  delay(100);
+}
